@@ -1,3 +1,4 @@
 i3-easyfocus
 src/*.o
 src/*.d
+fonts-for-xcb

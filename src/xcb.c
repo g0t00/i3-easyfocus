@@ -7,6 +7,7 @@
 #include <string.h>
 #include <xcb/xcb_keysyms.h>
 #include <X11/Xlib.h>
+#include "../fonts-for-xcb/xcbft/xcbft.h"
 
 #define BUFFER 512
 
@@ -22,6 +23,8 @@ static uint32_t color_unfocused_bg;
 static uint32_t color_urgent_fg;
 static uint32_t color_focused_fg;
 static uint32_t color_unfocused_fg;
+static struct xcbft_face_holder faces;
+static long dpi;
 
 static int request_failed(xcb_void_cookie_t cookie, char *err_msg)
 {
@@ -75,6 +78,7 @@ static xcb_char2b_t *string_to_char2b(const char *text, size_t len)
 static int predict_text_width(const char *text)
 {
     size_t len = strlen(text);
+    return (*faces.faces)->size->metrics.max_advance/64*len;
     xcb_char2b_t *str = string_to_char2b(text, len);
 
     xcb_query_text_extents_cookie_t cookie = xcb_query_text_extents(connection, font, len, str);
@@ -93,44 +97,28 @@ static int predict_text_width(const char *text)
     return width;
 }
 
-static int draw_text(xcb_window_t window, int16_t x, int16_t y, uint32_t color_bg, uint32_t color_fg, const char *label)
+static int draw_text(xcb_window_t window, int16_t x, int16_t y, xcb_render_color_t color_fg, const char *label)
 {
-    xcb_gcontext_t gc = xcb_generate_id(connection);
-    uint32_t mask = XCB_GC_FOREGROUND | XCB_GC_BACKGROUND | XCB_GC_FONT;
+//   xcb_render_color_t text_color;
+//
+//   text_color.red =  0xFFFF;
+// text_color.green = 0xFFFF;
+// text_color.blue = 0xFFFF;
+// text_color.alpha = 0xFFFF;
+struct utf_holder text;
+text = char_to_uint32((char *)label);
 
-    uint32_t value_list[3] = {color_fg, color_bg, font};
-
-    xcb_void_cookie_t gc_cookie = xcb_create_gc_checked(connection,
-                                                        gc,
-                                                        window,
-                                                        mask,
-                                                        value_list);
-
-    if (request_failed(gc_cookie, "cannot open gc"))
-    {
-        return 1;
-    }
-
-    xcb_void_cookie_t text_cookie = xcb_image_text_8_checked(connection,
-                                                             strlen(label),
-                                                             window,
-                                                             gc,
-                                                             x, y,
-                                                             label);
-
-    if (request_failed(text_cookie, "cannot paste text"))
-    {
-        return 1;
-    }
-
-    xcb_void_cookie_t gcfree_cookie = xcb_free_gc(connection, gc);
-    if (request_failed(gcfree_cookie, "cannot free gc"))
-    {
-        return 1;
-    }
-
+  xcbft_draw_text(
+    connection, // X connection
+    window, // win or pixmap
+    x, y, // x, y
+    text, // text
+    color_fg,
+    faces,
+    dpi);
     return 0;
 }
+
 
 static int color_by_window_type(WindowType windowType, uint32_t* color_bg, uint32_t* color_fg) {
     switch(windowType)
@@ -151,6 +139,33 @@ static int color_by_window_type(WindowType windowType, uint32_t* color_bg, uint3
         return 1;
     }
 }
+static ColorConfig g_color_config;
+
+static int color_by_window_type2(WindowType windowType, xcb_render_color_t* color_fg) {
+    switch(windowType)
+    {
+    case URGENT_WINDOW:
+    color_fg->red = g_color_config.urgent_fg.r;
+    color_fg->green = g_color_config.urgent_fg.g;
+    color_fg->blue = g_color_config.urgent_fg.b;
+    color_fg->alpha = 0xFFFF;
+        return 0;
+    case FOCUSED_WINDOW:
+    color_fg->red = g_color_config.focused_fg.r;
+    color_fg->green = g_color_config.focused_fg.g;
+    color_fg->blue = g_color_config.focused_fg.b;
+    color_fg->alpha = 0xFFFF;
+        return 0;
+    case UNFOCUSED_WINDOW:
+    color_fg->red = g_color_config.unfocused_fg.r;
+    color_fg->green = g_color_config.unfocused_fg.g;
+    color_fg->blue = g_color_config.unfocused_fg.b;
+    color_fg->alpha = 0xFFFF;
+        return 0;
+    default:
+        return 1;
+    }
+}
 
 int xcb_create_text_window(int pos_x, int pos_y, WindowType windowType, const char *label)
 {
@@ -163,6 +178,11 @@ int xcb_create_text_window(int pos_x, int pos_y, WindowType windowType, const ch
     if (color_by_window_type(windowType, &color_bg, &color_fg)) {
         LOG("cannot determine window colors\n");
         return 1;
+    }
+    xcb_render_color_t color_fg_xcb;
+    if (color_by_window_type2(windowType, &color_fg_xcb)) {
+      LOG("cannot determine window colors\n");
+      return 1;
     }
 
     xcb_window_t window = xcb_generate_id(connection);
@@ -179,7 +199,7 @@ int xcb_create_text_window(int pos_x, int pos_y, WindowType windowType, const ch
                                   pos_x,
                                   pos_y,
                                   width + 2,
-                                  font_info->font_ascent + font_info->font_descent,
+                                  (*faces.faces)->size->metrics.height/64,
                                   0,
                                   XCB_WINDOW_CLASS_INPUT_OUTPUT,
                                   screen->root_visual,
@@ -217,7 +237,7 @@ int xcb_create_text_window(int pos_x, int pos_y, WindowType windowType, const ch
             case XCB_EXPOSE:
             {
                 free(event);
-                if (draw_text(window, 1, font_info->font_ascent, color_bg, color_fg, label))
+                if (draw_text(window, 1, (*faces.faces)->size->metrics.ascender/64, color_fg_xcb, label))
                 {
                     LOG("error drawing text\n");
                     return 1;
@@ -448,7 +468,17 @@ static int open_font(const char *font_pattern)
 
     return request_failed(cookie, "cannot open font");
 }
-
+static int setup_xft() {
+  char *searchlist = "firacode:pixelsize=24\n";
+  FcStrSet * fontsearch = xcbft_extract_fontsearch_list(searchlist);
+  struct xcbft_patterns_holder font_patterns = xcbft_query_fontsearch_all(fontsearch);
+  FcStrSetDestroy(fontsearch);
+  dpi = xcbft_get_dpi(connection);
+  faces = xcbft_load_faces(font_patterns, dpi);
+  xcbft_patterns_holder_destroy(font_patterns);
+  printf("%s %d %d\n", faces.faces[0]->family_name, (*faces.faces)->ascender/30, (*faces.faces)->size->metrics.ascender/64);
+  return 0;
+}
 static int open_font_with_fallback(const char *font_name)
 {
     font = xcb_generate_id(connection);
@@ -461,9 +491,9 @@ static int open_font_with_fallback(const char *font_name)
 
     return 0;
 }
-
 int xcb_init(const char *font_name, ColorConfig color_config)
 {
+  g_color_config = color_config;
     connection = xcb_connect(NULL, NULL);
     if (xcb_connection_has_error(connection))
     {
@@ -479,7 +509,7 @@ int xcb_init(const char *font_name, ColorConfig color_config)
         xcb_disconnect(connection);
         return 1;
     }
-
+    setup_xft();
     if (open_font_with_fallback(font_name))
     {
         xcb_disconnect(connection);
